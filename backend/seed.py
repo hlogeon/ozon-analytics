@@ -36,9 +36,9 @@ def seed_demo(force: bool = False) -> None:
         for idx, (sku, name) in enumerate(NAMES, 1):
             db.execute(
                 "INSERT INTO products(id,sku_original,sku_normalized,name,offer_id,scheme,price,mapping_status,source) VALUES(?,?,?,?,?,?,?,?,?)",
-                (idx, sku, normalize_sku(sku), name, sku if idx <= 32 else None,
+                (idx, sku, normalize_sku(sku), name, None,
                  "FBO" if idx % 4 else "FBS", 799 + (idx % 5) * 40,
-                 "linked" if idx <= 32 else "unmatched", "excel_demo"),
+                 "unmatched", "excel_demo"),
             )
             db.execute(
                 "INSERT INTO unit_economics(product_id,valid_from,purchase_price,marking,packaging,inbound_delivery,cross_dock,tax_rate,planned_commission,planned_logistics,other_fixed) VALUES(?,?,?,?,?,?,?,?,?,?,?)",

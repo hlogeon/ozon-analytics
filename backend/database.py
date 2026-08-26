@@ -62,6 +62,13 @@ def init_db() -> None:
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               FOREIGN KEY(product_id) REFERENCES products(id)
             );
+            CREATE TABLE IF NOT EXISTS daily_notes (
+              id INTEGER PRIMARY KEY, day TEXT NOT NULL, product_id INTEGER NOT NULL,
+              comment TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT 'Администратор',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(day, product_id), FOREIGN KEY(product_id) REFERENCES products(id)
+            );
             CREATE TABLE IF NOT EXISTS ozon_postings (
               posting_number TEXT PRIMARY KEY, scheme TEXT NOT NULL, status TEXT,
               occurred_at TEXT, raw_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -85,7 +92,22 @@ def init_db() -> None:
               products INTEGER NOT NULL DEFAULT 0, rows INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, details TEXT
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS unit_economics_product_valid
+              ON unit_economics(product_id, valid_from);
+            CREATE INDEX IF NOT EXISTS daily_kpi_day_source
+              ON daily_kpi(day, source);
+            CREATE INDEX IF NOT EXISTS manual_costs_day_product
+              ON manual_costs(day, product_id);
+            CREATE INDEX IF NOT EXISTS daily_notes_day_product
+              ON daily_notes(day, product_id);
             """
+        )
+        # Early MVP builds marked demo SKU values as linked offer_id values even though
+        # no Ozon cabinet had been synchronized. Correct only that untouched legacy state.
+        db.execute(
+            "UPDATE products SET offer_id=NULL,mapping_status='unmatched' "
+            "WHERE source='excel_demo' AND ozon_product_id IS NULL "
+            "AND offer_id=sku_original AND NOT EXISTS (SELECT 1 FROM sync_runs)"
         )
 
 
