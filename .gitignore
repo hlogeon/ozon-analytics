@@ -6,3 +6,7 @@ dist/
 __pycache__/
 .pytest_cache/
 .venv/
+.gitignore
+.env
+tmp/
+*.bak

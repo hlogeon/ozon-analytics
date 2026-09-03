@@ -1,32 +1,52 @@
 from __future__ import annotations
 
 import io
-import json
+import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .database import connection, init_db, json_dump, one, rows
+from .config import ozon_credentials
+from .database import connection, init_db, one, rows
 from .ozon import OzonClient, OzonError
-from .seed import normalize_sku, seed_demo
+from .reports import alerts_report, daily_report, latest_kpi_day, timeseries_report
+from .skus import normalize_sku
+from .sync import (
+    MOSCOW,
+    SyncBusyError,
+    begin_sync_run,
+    execute_sync_run,
+    moscow_day_bounds,
+    recover_stale_runs,
+    scheduler_status,
+    start_scheduler,
+    stop_scheduler,
+    sync_window,
+)
 
-MOSCOW = ZoneInfo("Europe/Moscow")
+FAST_SYNC_LOOKBACK_DAYS = 2
+
+_credentials: dict[str, str] = {}
+_scheduler_task = None
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _scheduler_task
     init_db()
-    seed_demo()
+    recover_stale_runs()
+    _credentials.update(ozon_credentials())
+    _scheduler_task = start_scheduler(_credentials)
     yield
+    await stop_scheduler(_scheduler_task)
 
 
 app = FastAPI(title="Ozon Analytics API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
-_credentials: dict[str, str] = {}
 
 
 class CostIn(BaseModel):
@@ -73,213 +93,123 @@ class NoteIn(BaseModel):
     comment: str = Field(default="", max_length=1000)
 
 
-def _number(value: object) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
+def _seller_name(info: dict) -> str | None:
+    company = info.get("company")
+    if isinstance(company, dict):
+        return company.get("name") or company.get("legal_name")
+    if isinstance(company, str) and company:
+        return company
+    name = info.get("name")
+    return name if isinstance(name, str) else None
 
 
-def _day_in_moscow(value: str | None) -> str:
-    if not value:
-        return datetime.now(MOSCOW).date().isoformat()
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(MOSCOW).date().isoformat()
-    except ValueError:
-        return value[:10]
+def _today_moscow() -> date:
+    return datetime.now(MOSCOW).date()
 
 
-def _upsert_product(db, item: dict, scheme: str | None = None) -> int:
-    offer = str(item.get("offer_id") or item.get("sku") or "").strip()
-    if not offer:
-        raise ValueError("Ozon вернул товар без offer_id")
-    normalized = normalize_sku(offer)
-    product_id = item.get("product_id") or item.get("sku")
-    existing = db.execute(
-        "SELECT id FROM products WHERE (? IS NOT NULL AND ozon_product_id=?) OR offer_id=? "
-        "OR sku_normalized=? ORDER BY mapping_status='linked' DESC,source<>'ozon' DESC LIMIT 1",
-        (product_id, product_id, offer, normalized),
-    ).fetchone()
-    name = str(item.get("name") or offer)
-    price = _number(item.get("price"))
-    if existing:
-        db.execute(
-            "UPDATE products SET offer_id=?,ozon_product_id=COALESCE(?,ozon_product_id),"
-            "name=CASE WHEN source='ozon' AND ?<>? THEN ? ELSE name END,scheme=COALESCE(?,scheme),"
-            "price=CASE WHEN ?>0 THEN ? ELSE price END,mapping_status='linked' WHERE id=?",
-            (offer, product_id, name, offer, name, scheme, price, price, existing["id"]),
-        )
-        return existing["id"]
-    cursor = db.execute(
-        "INSERT INTO products(sku_original,sku_normalized,name,offer_id,ozon_product_id,"
-        "scheme,price,mapping_status,source) VALUES(?,?,?,?,?,?,?,?,?)",
-        (offer, normalized, name, offer, product_id, scheme, price, "linked", "ozon"),
+def _resolve_day(day: date | None) -> date:
+    return day or _today_moscow()
+
+
+def _last_sync_finished_at() -> str | None:
+    last = one(
+        "SELECT finished_at FROM sync_runs WHERE status IN ('success','partial') "
+        "ORDER BY id DESC LIMIT 1"
     )
-    new_id = cursor.lastrowid
-    db.execute(
-        "INSERT INTO unit_economics(product_id,valid_from) VALUES(?,?)",
-        (new_id, date.today().isoformat()),
-    )
-    return new_id
-
-
-def _posting_fees(posting: dict) -> tuple[dict[str, float], float]:
-    finance = posting.get("financial_data") or {}
-    by_offer: dict[str, float] = {}
-    for item in finance.get("products") or []:
-        fee = abs(_number(item.get("commission_amount")))
-        fee += sum(abs(_number(value)) for value in (item.get("item_services") or {}).values())
-        identifiers = {item.get("offer_id"), item.get("product_id")}
-        for identifier in identifiers - {None, ""}:
-            key = normalize_sku(identifier)
-            by_offer[key] = by_offer.get(key, 0) + fee
-    common = sum(abs(_number(value)) for value in (finance.get("posting_services") or {}).values())
-    return by_offer, common
-
-
-def _rebuild_live_kpi(db, since_day: str, to_day: str) -> int:
-    db.execute(
-        "DELETE FROM daily_kpi WHERE source='ozon' AND day BETWEEN ? AND ?",
-        (since_day, to_day),
-    )
-    aggregates: dict[tuple[str, int], dict] = {}
-    postings = db.execute(
-        "SELECT scheme,status,occurred_at,raw_json FROM ozon_postings "
-        "WHERE substr(occurred_at,1,10) BETWEEN ? AND ?",
-        (since_day, to_day),
-    ).fetchall()
-    for stored in postings:
-        posting = json.loads(stored["raw_json"])
-        status = (posting.get("status") or stored["status"] or "").casefold()
-        day = _day_in_moscow(stored["occurred_at"])
-        products = posting.get("products") or []
-        posting_revenue = sum(
-            _number(item.get("price")) * int(item.get("quantity") or 1) for item in products
-        )
-        fees_by_offer, common_fees = _posting_fees(posting)
-        settled = bool(posting.get("financial_data"))
-        for item in products:
-            product_id = _upsert_product(db, item, stored["scheme"])
-            quantity = int(item.get("quantity") or 1)
-            cancelled = quantity if "cancel" in status else 0
-            returned = quantity if "return" in status else 0
-            sold = 0 if cancelled or returned else quantity
-            revenue = _number(item.get("price")) * sold
-            offer = normalize_sku(item.get("offer_id") or "")
-            sku = normalize_sku(item.get("sku") or item.get("product_id") or "")
-            fees = fees_by_offer.get(offer, fees_by_offer.get(sku, 0))
-            if posting_revenue:
-                fees += common_fees * revenue / posting_revenue
-            economics = db.execute(
-                "SELECT * FROM unit_economics WHERE product_id=? "
-                "ORDER BY valid_from DESC LIMIT 1",
-                (product_id,),
-            ).fetchone()
-            unit_cost = sum(
-                economics[key]
-                for key in ("purchase_price", "marking", "packaging", "inbound_delivery", "cross_dock", "other_fixed")
-            )
-            cogs = unit_cost * sold
-            tax = revenue * economics["tax_rate"]
-            if not settled:
-                fees = revenue * economics["planned_commission"] + sold * economics["planned_logistics"]
-            key = (day, product_id)
-            row = aggregates.setdefault(
-                key,
-                {"sold": 0, "returns": 0, "cancelled": 0, "revenue": 0.0,
-                 "ozon_fees": 0.0, "cogs": 0.0, "tax": 0.0, "settled": True},
-            )
-            row["sold"] += sold
-            row["returns"] += returned
-            row["cancelled"] += cancelled
-            row["revenue"] += revenue
-            row["ozon_fees"] += fees
-            row["cogs"] += cogs
-            row["tax"] += tax
-            row["settled"] = row["settled"] and settled
-    for (day, product_id), item in aggregates.items():
-        profit = item["revenue"] - item["ozon_fees"] - item["cogs"] - item["tax"]
-        db.execute(
-            "INSERT INTO daily_kpi(day,product_id,sold,returns,cancelled,revenue,ozon_fees,"
-            "cogs,tax,profit,status,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (day, product_id, item["sold"], item["returns"], item["cancelled"],
-             round(item["revenue"], 2), round(item["ozon_fees"], 2),
-             round(item["cogs"], 2), round(item["tax"], 2), round(profit, 2),
-             "settled" if item["settled"] else "preliminary", "ozon"),
-        )
-    return len(aggregates)
+    return last["finished_at"] if last else None
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "database": "connected", "mode": "ozon" if _credentials else "excel_demo"}
+    return {"status": "ok", "database": "connected", "mode": "ozon" if _credentials else "offline"}
 
 
 @app.get("/api/dashboard")
 def dashboard(day: date | None = Query(default=None)) -> dict:
-    if day is None:
-        latest = one("SELECT MAX(day) day FROM daily_kpi")
-        day = date.fromisoformat(latest["day"]) if latest and latest["day"] else date(2026, 7, 2)
-    report = daily(day)
+    day = _resolve_day(day)
+    latest_day = latest_kpi_day()
+    last_synced_at = _last_sync_finished_at()
+    report = daily_report(day)
     if not report["items"]:
-        raise HTTPException(404, "За выбранную дату данных нет")
+        return {
+            "day": str(day),
+            "latest_day": str(latest_day) if latest_day else None,
+            "last_synced_at": last_synced_at,
+            "source": "ozon" if _credentials else None,
+            "status": None,
+            "kpi": None,
+            "previous": None,
+            "leaders": [],
+            "empty": True,
+        }
     totals = report["totals"]
     current = {**totals, "extra": totals["extra_costs"]}
-    previous_report = daily(day - timedelta(days=1))
+    previous_report = daily_report(day - timedelta(days=1))
     previous = previous_report["totals"] if previous_report["items"] else None
     leaders = sorted(report["items"], key=lambda item: item["profit"], reverse=True)[:5]
     sources = {item["source"] for item in report["items"]}
-    source = "ozon" if "ozon" in sources else "excel_demo"
+    source = "ozon" if "ozon" in sources else "manual"
     statuses = {item["status"] for item in report["items"]}
-    status = "demo" if source == "excel_demo" else ("settled" if statuses == {"settled"} else "preliminary")
-    return {"day": str(day), "source": source, "status": status, "kpi": current, "previous": previous, "leaders": leaders}
+    status = "settled" if statuses == {"settled"} else "preliminary"
+    return {
+        "day": str(day),
+        "latest_day": str(latest_day) if latest_day else None,
+        "last_synced_at": last_synced_at,
+        "source": source,
+        "status": status,
+        "kpi": current,
+        "previous": previous,
+        "leaders": leaders,
+        "empty": False,
+    }
 
 
 @app.get("/api/daily")
-def daily(day: date = Query(default=date(2026, 7, 2)), search: str = "", scheme: str = "") -> dict:
-    clauses, params = ["k.day=?"], [str(day)]
-    if search:
-        clauses.append("(p.name LIKE ? OR p.sku_original LIKE ? OR p.sku_normalized LIKE ?)")
-        params += [f"%{search}%"] * 3
-    if scheme in ("FBO", "FBS"):
-        clauses.append("p.scheme=?"); params.append(scheme)
-    data = rows(f"SELECT p.id product_id,p.name,p.sku_original sku,p.scheme,k.sold,k.returns,k.cancelled,k.revenue,k.ads,k.extra_costs,k.profit,k.status,k.source,COALESCE((SELECT comment FROM daily_notes n WHERE n.day=k.day AND n.product_id=k.product_id),'') note FROM daily_kpi k JOIN products p ON p.id=k.product_id WHERE {' AND '.join(clauses)} ORDER BY k.profit DESC", tuple(params))
-    product_costs = rows(
-        "SELECT product_id,kind,SUM(amount) amount FROM manual_costs "
-        "WHERE day=? AND product_id IS NOT NULL GROUP BY product_id,kind",
-        (str(day),),
-    )
-    cost_map = {(item["product_id"], item["kind"]): item["amount"] for item in product_costs}
-    for item in data:
-        manual_ads = cost_map.get((item["product_id"], "ads"), 0)
-        manual_extra = cost_map.get((item["product_id"], "extra"), 0)
-        item["ads"] = round(item["ads"] + manual_ads, 2)
-        item["extra_costs"] = round(item["extra_costs"] + manual_extra, 2)
-        item["profit"] = round(item["profit"] - manual_ads - manual_extra, 2)
-        item["drr"] = round(item["ads"] / item["revenue"] * 100, 2) if item["revenue"] else None
-        item["margin"] = round(item["profit"] / item["revenue"] * 100, 2) if item["revenue"] else None
-    totals = {key: round(sum((item[key] or 0) for item in data), 2) for key in ("sold", "revenue", "ads", "extra_costs", "profit")}
-    unallocated = rows(
-        "SELECT kind,COALESCE(SUM(amount),0) amount FROM manual_costs "
-        "WHERE day=? AND product_id IS NULL GROUP BY kind",
-        (str(day),),
-    )
-    unallocated_map = {item["kind"]: item["amount"] for item in unallocated}
-    totals["ads"] = round(totals["ads"] + unallocated_map.get("ads", 0), 2)
-    totals["extra_costs"] = round(totals["extra_costs"] + unallocated_map.get("extra", 0), 2)
-    totals["profit"] = round(totals["profit"] - sum(unallocated_map.values()), 2)
-    totals.update(sku_count=len(data), drr=round(totals["ads"] / totals["revenue"] * 100, 2) if totals["revenue"] else None, margin=round(totals["profit"] / totals["revenue"] * 100, 2) if totals["revenue"] else None)
-    return {"items": data, "totals": totals, "unallocated_costs": {"ads": unallocated_map.get("ads", 0), "extra": unallocated_map.get("extra", 0)}}
+def daily(day: date | None = Query(default=None), search: str = "", scheme: str = "") -> dict:
+    return daily_report(_resolve_day(day), search, scheme)
+
+
+@app.get("/api/timeseries")
+def timeseries(
+    from_day: date = Query(alias="from"),
+    to_day: date = Query(alias="to"),
+) -> dict:
+    if from_day > to_day:
+        raise HTTPException(422, "Некорректный период")
+    return timeseries_report(from_day, to_day)
+
+
+@app.get("/api/alerts")
+def alerts(
+    from_day: date = Query(alias="from"),
+    to_day: date = Query(alias="to"),
+) -> dict:
+    if from_day > to_day:
+        raise HTTPException(422, "Некорректный период")
+    return alerts_report(from_day, to_day)
 
 
 @app.get("/api/products")
 def products(search: str = "") -> dict:
     pattern = f"%{search}%"
-    data = rows("SELECT p.*,u.purchase_price,u.marking,u.packaging,u.inbound_delivery,u.cross_dock,u.tax_rate,u.planned_commission,u.planned_logistics,u.other_fixed,ROUND(p.price-u.purchase_price-u.marking-u.packaging-u.inbound_delivery-u.cross_dock-u.planned_commission*p.price-u.planned_logistics-u.other_fixed,2) net_per_sale FROM products p LEFT JOIN unit_economics u ON u.id=(SELECT id FROM unit_economics WHERE product_id=p.id ORDER BY valid_from DESC LIMIT 1) WHERE p.name LIKE ? OR p.sku_original LIKE ? ORDER BY p.id", (pattern, pattern))
-    return {"items": data, "summary": {"active": len(data), "linked": sum(x["mapping_status"] == "linked" for x in data), "without_cost": sum(not x["purchase_price"] for x in data)}}
+    data = rows(
+        "SELECT p.*,u.purchase_price,u.marking,u.packaging,u.inbound_delivery,u.cross_dock,u.tax_rate,"
+        "u.planned_commission,u.planned_logistics,u.other_fixed,"
+        "ROUND(p.price-u.purchase_price-u.marking-u.packaging-u.inbound_delivery-u.cross_dock-"
+        "u.planned_commission*p.price-u.planned_logistics-u.other_fixed,2) net_per_sale "
+        "FROM products p LEFT JOIN unit_economics u ON u.id=("
+        "SELECT id FROM unit_economics WHERE product_id=p.id ORDER BY valid_from DESC LIMIT 1) "
+        "WHERE p.name LIKE ? OR p.sku_original LIKE ? ORDER BY p.id",
+        (pattern, pattern),
+    )
+    return {
+        "items": data,
+        "summary": {
+            "active": len(data),
+            "linked": sum(x["mapping_status"] == "linked" for x in data),
+            "without_cost": sum(not x["purchase_price"] for x in data),
+        },
+    }
 
 
 def _validate_sku(db, sku: str, product_id: int | None = None) -> str:
@@ -451,7 +381,11 @@ def update_economics(product_id: int, values: EconomicsIn) -> dict:
 @app.get("/api/costs")
 def costs(day: date | None = None) -> list[dict]:
     where, params = ("WHERE m.day=?", (str(day),)) if day else ("", ())
-    return rows(f"SELECT m.*,p.name product,p.sku_original sku FROM manual_costs m LEFT JOIN products p ON p.id=m.product_id {where} ORDER BY m.created_at DESC", params)
+    return rows(
+        f"SELECT m.*,p.name product,p.sku_original sku FROM manual_costs m "
+        f"LEFT JOIN products p ON p.id=m.product_id {where} ORDER BY m.created_at DESC",
+        params,
+    )
 
 
 @app.post("/api/costs", status_code=201)
@@ -459,7 +393,10 @@ def add_cost(cost: CostIn) -> dict:
     with connection() as db:
         if cost.product_id and not db.execute("SELECT 1 FROM products WHERE id=?", (cost.product_id,)).fetchone():
             raise HTTPException(404, "Товар не найден")
-        cursor = db.execute("INSERT INTO manual_costs(day,kind,product_id,amount,comment) VALUES(?,?,?,?,?)", (str(cost.day), cost.kind, cost.product_id, cost.amount, cost.comment.strip()))
+        cursor = db.execute(
+            "INSERT INTO manual_costs(day,kind,product_id,amount,comment) VALUES(?,?,?,?,?)",
+            (str(cost.day), cost.kind, cost.product_id, cost.amount, cost.comment.strip()),
+        )
         return {"id": cursor.lastrowid, **cost.model_dump(mode="json")}
 
 
@@ -488,8 +425,14 @@ def delete_cost(cost_id: int) -> Response:
 
 @app.get("/api/ozon/status")
 def ozon_status() -> dict:
-    last = one("SELECT task,status,finished_at,error,records FROM sync_runs ORDER BY id DESC LIMIT 1")
-    return {"connected": bool(_credentials), "client_id": _credentials.get("client_id"), "api_key": None, "last_run": last}
+    last = one("SELECT task,status,finished_at,error,records,window_from,window_to FROM sync_runs ORDER BY id DESC LIMIT 1")
+    return {
+        "connected": bool(_credentials),
+        "client_id": _credentials.get("client_id"),
+        "api_key": None,
+        "last_run": last,
+        **scheduler_status(),
+    }
 
 
 @app.post("/api/ozon/connect")
@@ -499,57 +442,47 @@ def connect_ozon(credentials: CredentialsIn) -> dict:
     except OzonError as exc:
         raise HTTPException(502, str(exc)) from exc
     _credentials.update(client_id=credentials.client_id, api_key=credentials.api_key)
-    return {"connected": True, "client_id": credentials.client_id, "api_key": None, "company": info.get("name") or info.get("company")}
+    return {"connected": True, "client_id": credentials.client_id, "api_key": None, "company": _seller_name(info)}
 
 
-@app.post("/api/ozon/sync")
-def sync_ozon() -> dict:
+@app.post("/api/ozon/sync", status_code=202)
+def sync_ozon(
+    fast: bool = Query(default=True),
+    from_day: date | None = Query(default=None, alias="from"),
+    to_day: date | None = Query(default=None, alias="to"),
+) -> dict:
+    """Kick off a read-only sync in the background and return immediately.
+
+    Progress is observed via /api/ozon/status (running/last_run); the
+    frontend polls it. `fast` (default) refreshes just the last two days for
+    quick manual "текущий контроль" checks; without it a full incremental
+    catch-up runs; an explicit from/to overrides both for one-off backfills.
+    """
     if not _credentials:
         raise HTTPException(409, "Сначала подключите кабинет Ozon")
-    now = datetime.now(timezone.utc); since = now - timedelta(days=14)
-    with connection() as db:
-        run = db.execute("INSERT INTO sync_runs(task,status) VALUES('full','running')").lastrowid
-    count = 0
+    now = datetime.now(timezone.utc)
+    if from_day and to_day:
+        if from_day > to_day:
+            raise HTTPException(422, "Некорректный период")
+        window_from = moscow_day_bounds(from_day)[0]
+        window_to = moscow_day_bounds(to_day)[1]
+        task = "manual-range"
+    elif fast:
+        window_from, window_to = now - timedelta(days=FAST_SYNC_LOOKBACK_DAYS), now
+        task = "fast"
+    else:
+        window_from, window_to = sync_window(now)
+        task = "full"
     try:
-        client = OzonClient(**_credentials)
-        product_payload = client.products()
-        product_items = product_payload.get("result", {}).get("items", [])
-        with connection() as db:
-            for item in product_items:
-                _upsert_product(db, item)
-            for scheme, payload in (("FBS", client.fbs_postings(since.isoformat(), now.isoformat())), ("FBO", client.fbo_postings(since.isoformat(), now.isoformat()))):
-                result = payload.get("result") or []
-                postings = result.get("postings", []) if isinstance(result, dict) else result
-                for posting in postings:
-                    number = posting.get("posting_number") or posting.get("order_number")
-                    if not number:
-                        continue
-                    for item in posting.get("products") or []:
-                        _upsert_product(db, item, scheme)
-                    db.execute("INSERT INTO ozon_postings(posting_number,scheme,status,occurred_at,raw_json) VALUES(?,?,?,?,?) ON CONFLICT(posting_number) DO UPDATE SET status=excluded.status,raw_json=excluded.raw_json,updated_at=CURRENT_TIMESTAMP", (number, scheme, posting.get("status"), posting.get("in_process_at") or posting.get("created_at"), json_dump(posting)))
-                    count += 1
-            finance_payload = client.finance(since.isoformat(), now.isoformat())
-            operations = finance_payload.get("result", {}).get("operations", [])
-            for operation in operations:
-                operation_id = str(operation.get("operation_id") or operation.get("id") or "")
-                if not operation_id:
-                    continue
-                db.execute(
-                    "INSERT INTO ozon_finance_operations(operation_id,occurred_at,operation_type,amount,raw_json) "
-                    "VALUES(?,?,?,?,?) ON CONFLICT(operation_id) DO UPDATE SET occurred_at=excluded.occurred_at,"
-                    "operation_type=excluded.operation_type,amount=excluded.amount,raw_json=excluded.raw_json",
-                    (operation_id, operation.get("operation_date") or operation.get("created_at"),
-                     operation.get("operation_type"), _number(operation.get("amount")), json_dump(operation)),
-                )
-            kpi_rows = _rebuild_live_kpi(db, since.date().isoformat(), now.date().isoformat())
-            records = count + len(product_items) + len(operations) + kpi_rows
-            db.execute("UPDATE sync_runs SET status='success',finished_at=CURRENT_TIMESTAMP,records=? WHERE id=?", (records, run))
-    except Exception as exc:
-        with connection() as db:
-            db.execute("UPDATE sync_runs SET status='error',finished_at=CURRENT_TIMESTAMP,error=? WHERE id=?", (str(exc)[:500], run))
-        raise HTTPException(502, str(exc)) from exc
-    latest = one("SELECT MAX(day) day FROM daily_kpi WHERE source='ozon'")
-    return {"status": "success", "records": records, "latest_day": latest["day"] if latest else None}
+        run_id = begin_sync_run(task, window_from, window_to)
+    except SyncBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    threading.Thread(
+        target=execute_sync_run,
+        args=(run_id, dict(_credentials), window_from, window_to),
+        daemon=True,
+    ).start()
+    return {"status": "started", "run_id": run_id, "task": task}
 
 
 @app.get("/api/sync-runs")
@@ -558,22 +491,42 @@ def sync_runs() -> list[dict]:
 
 
 @app.get("/api/export.xlsx")
-def export_excel(day: date = Query(default=date(2026, 7, 2))):
+def export_excel(day: date | None = Query(default=None)):
     try:
         from openpyxl import Workbook
     except ImportError as exc:
         raise HTTPException(503, "Для экспорта установите openpyxl") from exc
-    data = daily(day)
-    workbook = Workbook(); sheet = workbook.active; sheet.title = str(day)
-    headers = ["Товар", "SKU", "Схема", "Продано", "Выручка", "Реклама", "ДРР", "Доп. расходы", "Чистая прибыль", "Маржа", "Статус"]
+    selected = _resolve_day(day)
+    data = daily_report(selected)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = str(selected)
+    headers = ["Товар", "SKU", "Схема", "Продано", "Выручка", "Реклама", "ДРР", "Доп. расходы",
+               "Чистая прибыль", "Маржа", "Статус"]
     sheet.append(headers)
     for item in data["items"]:
-        sheet.append([item["name"], item["sku"], item["scheme"], item["sold"], item["revenue"], item["ads"], item["drr"], item["extra_costs"], item["profit"], item["margin"], item["status"]])
+        sheet.append([
+            item["name"], item["sku"], item["scheme"], item["sold"], item["revenue"], item["ads"],
+            item["drr"], item["extra_costs"], item["profit"], item["margin"], item["status"],
+        ])
     common = data["unallocated_costs"]
     if common["ads"] or common["extra"]:
-        sheet.append(["Общий расход дня", "—", "—", 0, 0, common["ads"], None, common["extra"], -(common["ads"] + common["extra"]), None, "manual"])
+        sheet.append([
+            "Общий расход дня", "—", "—", 0, 0, common["ads"], None, common["extra"],
+            -(common["ads"] + common["extra"]), None, "manual",
+        ])
     totals = data["totals"]
-    sheet.append(["Итого", f'{totals["sku_count"]} SKU', "", totals["sold"], totals["revenue"], totals["ads"], totals["drr"], totals["extra_costs"], totals["profit"], totals["margin"], ""])
-    sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
-    output = io.BytesIO(); workbook.save(output); output.seek(0)
-    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="ozon-analytics-{day}.xlsx"'})
+    sheet.append([
+        "Итого", f'{totals["sku_count"]} SKU', "", totals["sold"], totals["revenue"], totals["ads"],
+        totals["drr"], totals["extra_costs"], totals["profit"], totals["margin"], "",
+    ])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="ozon-analytics-{selected}.xlsx"'},
+    )

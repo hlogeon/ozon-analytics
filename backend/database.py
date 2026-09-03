@@ -85,7 +85,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sync_runs (
               id INTEGER PRIMARY KEY, task TEXT NOT NULL, status TEXT NOT NULL,
               started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT,
-              records INTEGER NOT NULL DEFAULT 0, error TEXT
+              records INTEGER NOT NULL DEFAULT 0, error TEXT,
+              window_from TEXT, window_to TEXT
             );
             CREATE TABLE IF NOT EXISTS import_runs (
               id INTEGER PRIMARY KEY, filename TEXT NOT NULL, status TEXT NOT NULL,
@@ -102,13 +103,26 @@ def init_db() -> None:
               ON daily_notes(day, product_id);
             """
         )
-        # Early MVP builds marked demo SKU values as linked offer_id values even though
-        # no Ozon cabinet had been synchronized. Correct only that untouched legacy state.
-        db.execute(
-            "UPDATE products SET offer_id=NULL,mapping_status='unmatched' "
-            "WHERE source='excel_demo' AND ozon_product_id IS NULL "
-            "AND offer_id=sku_original AND NOT EXISTS (SELECT 1 FROM sync_runs)"
-        )
+        _ensure_column(db, "sync_runs", "window_from", "TEXT")
+        _ensure_column(db, "sync_runs", "window_to", "TEXT")
+        _purge_demo(db)
+
+
+def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _purge_demo(db: sqlite3.Connection) -> None:
+    demo_ids = "SELECT id FROM products WHERE source='excel_demo'"
+    db.execute(f"DELETE FROM daily_kpi WHERE source='excel_demo' OR product_id IN ({demo_ids})")
+    db.execute(f"DELETE FROM daily_notes WHERE product_id IN ({demo_ids})")
+    db.execute(f"DELETE FROM manual_costs WHERE product_id IN ({demo_ids})")
+    db.execute(f"DELETE FROM unit_economics WHERE product_id IN ({demo_ids})")
+    db.execute(f"DELETE FROM stock_snapshots WHERE product_id IN ({demo_ids})")
+    db.execute("DELETE FROM products WHERE source='excel_demo'")
+    db.execute("DELETE FROM import_runs")
 
 
 def rows(query: str, params: tuple = ()) -> list[dict]:
