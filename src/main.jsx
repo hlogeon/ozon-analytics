@@ -27,6 +27,39 @@ const formatWhen = value => {
   if (Number.isNaN(parsed.getTime())) return value;
   return parsed.toLocaleString('ru-RU', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'});
 };
+const round2 = n => Math.round(n * 100) / 100;
+const sumTotals = items => {
+  const totals = items.reduce((acc, item) => ({
+    sku_count: acc.sku_count + 1,
+    sold: acc.sold + (item.sold || 0),
+    revenue: acc.revenue + (item.revenue || 0),
+    ads: acc.ads + (item.ads || 0),
+    extra_costs: acc.extra_costs + (item.extra_costs || 0),
+    profit: acc.profit + (item.profit || 0),
+  }), {sku_count: 0, sold: 0, revenue: 0, ads: 0, extra_costs: 0, profit: 0});
+  return {
+    sku_count: totals.sku_count,
+    sold: totals.sold,
+    revenue: round2(totals.revenue),
+    ads: round2(totals.ads),
+    extra_costs: round2(totals.extra_costs),
+    profit: round2(totals.profit),
+    drr: totals.revenue ? round2((totals.ads / totals.revenue) * 100) : null,
+    margin: totals.revenue ? round2((totals.profit / totals.revenue) * 100) : null,
+  };
+};
+
+const SYNC_POLL_MS = 2000;
+const SYNC_POLL_ATTEMPTS = 450;
+// /api/ozon/sync returns 202 immediately, so completion is observed via status polling.
+const waitForSync = async () => {
+  for (let attempt = 0; attempt < SYNC_POLL_ATTEMPTS; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, SYNC_POLL_MS));
+    const status = await api.status();
+    if (!status.running) return status;
+  }
+  return null;
+};
 
 function App() {
   const [page, setPage] = useState('Главная');
@@ -523,11 +556,13 @@ function Daily({tab, setTab, day, revision, notify, onExpense, onNote, initialFi
     );
     return () => clearTimeout(timer);
   }, [search, scheme, day, revision]);
+  const alertFilter = initialFilter?.kind === 'loss' || initialFilter?.kind === 'high_drr';
   const rows = (remote?.items || []).filter(item => {
     if (initialFilter?.kind === 'loss') return item.profit < 0;
     if (initialFilter?.kind === 'high_drr') return item.drr !== null && item.drr > 20;
     return true;
   });
+  const totals = alertFilter ? sumTotals(rows) : remote?.totals;
   return (
     <div className="content">
       <div className="tabs">
@@ -545,7 +580,7 @@ function Daily({tab, setTab, day, revision, notify, onExpense, onNote, initialFi
         {initialFilter?.kind && <span className="filter-chip">{initialFilter.kind === 'loss' ? 'Только убыточные' : 'ДРР выше 20%'}</span>}
       </div>
       {tab === 'Товары'
-        ? <DataTable rows={rows} totals={remote?.totals} onExpense={onExpense} onNote={onNote} day={day} />
+        ? <DataTable rows={rows} totals={totals} onExpense={onExpense} onNote={onNote} day={day} />
         : <Expenses day={day} revision={revision} notify={notify} onEdit={onExpense} />}
     </div>
   );
@@ -980,10 +1015,18 @@ function SettingsModal({close, notify, onSynced}) {
   const sync = async () => {
     setBusy(true);
     try {
-      const result = await api.sync();
+      await api.sync();
       await load();
-      await onSynced(result.latest_day);
-      notify(`Синхронизация завершена: ${result.records} записей`);
+      const finished = await waitForSync();
+      await load();
+      if (!finished) {
+        notify('Синхронизация ещё выполняется, следите за статусом');
+        return;
+      }
+      await onSynced();
+      const run = finished.last_run;
+      if (run?.status === 'error') notify(`Синхронизация не удалась: ${run.error || 'неизвестная ошибка'}`);
+      else notify(`Синхронизация завершена: ${run?.records ?? 0} записей`);
     } catch (error) {
       await load();
       notify(error.message);

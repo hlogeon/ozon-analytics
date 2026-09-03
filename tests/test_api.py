@@ -305,6 +305,23 @@ def test_sync_window_resumes_from_partial_runs_too():
     assert until == now
 
 
+def test_sync_window_ignores_fast_and_manual_runs():
+    make_sync_run(task="fast", status="success", window_to="2026-08-22T12:00:00+00:00")
+    make_sync_run(task="manual-range", status="success", window_to="2026-08-21T21:00:00+00:00")
+    now = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
+    since, until = sync_window(now)
+    assert since == now - timedelta(days=DEFAULT_WINDOW_DAYS)
+    assert until == now
+
+
+def test_sync_window_keeps_full_watermark_after_a_fast_run():
+    make_sync_run(task="full", status="success", window_to="2026-08-20T12:00:00+00:00")
+    make_sync_run(task="fast", status="success", window_to="2026-08-22T12:00:00+00:00")
+    now = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
+    since, _until = sync_window(now)
+    assert since == datetime(2026, 8, 20, 12, tzinfo=timezone.utc) - timedelta(days=OVERLAP_DAYS)
+
+
 def test_iter_day_chunks_splits_window_into_moscow_calendar_days():
     window_from = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
     window_to = datetime(2026, 9, 3, 0, 0, tzinfo=timezone.utc)

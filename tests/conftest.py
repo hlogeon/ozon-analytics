@@ -12,7 +12,7 @@ os.environ["OZON_SYNC_INTERVAL_MINUTES"] = "0"
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.database import DB_PATH, init_db
+from backend.database import db_path, init_db
 from backend.main import _credentials, app
 from backend.sync import _sync_lock
 
@@ -33,7 +33,7 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def fresh_db():
-    DB_PATH.unlink(missing_ok=True)
+    db_path().unlink(missing_ok=True)
     init_db()
     _credentials.clear()
     if _sync_lock.locked():
@@ -42,7 +42,7 @@ def fresh_db():
     _credentials.clear()
     if _sync_lock.locked():
         _sync_lock.release()
-    DB_PATH.unlink(missing_ok=True)
+    db_path().unlink(missing_ok=True)
 
 
 @pytest.fixture

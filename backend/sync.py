@@ -19,6 +19,10 @@ MOSCOW = ZoneInfo("Europe/Moscow")
 OVERLAP_DAYS = 3
 DEFAULT_WINDOW_DAYS = 14
 MAX_WINDOW_DAYS = 90
+# Only these tasks cover a contiguous window up to their window_to, so only they
+# may advance the incremental watermark. Short "fast" refreshes and one-off
+# "manual-range" backfills leave gaps and must never shrink the next full sync.
+WATERMARK_TASKS = ("full",)
 
 _sync_lock = threading.Lock()
 _scheduler_state: dict[str, object] = {
@@ -208,9 +212,12 @@ def _parse_iso(value: str) -> datetime:
 
 def sync_window(now: datetime | None = None) -> tuple[datetime, datetime]:
     moment = now or datetime.now(timezone.utc)
+    placeholders = ",".join("?" * len(WATERMARK_TASKS))
     last = one(
-        "SELECT window_to FROM sync_runs WHERE status IN ('success','partial') "
-        "AND window_to IS NOT NULL ORDER BY id DESC LIMIT 1"
+        f"SELECT window_to FROM sync_runs WHERE task IN ({placeholders}) "
+        "AND status IN ('success','partial') AND window_to IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        WATERMARK_TASKS,
     )
     if not last:
         return moment - timedelta(days=DEFAULT_WINDOW_DAYS), moment

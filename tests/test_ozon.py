@@ -5,6 +5,7 @@ from email.message import Message
 import pytest
 
 from backend.config import ozon_credentials, read_env_file
+from backend.database import connection, db_path
 from backend.main import _seller_name
 from backend.sync import is_settled as _is_settled, posting_fees as _posting_fees
 from backend.ozon import OzonClient, OzonError, finance_period, http_transport, retry_delay
@@ -53,6 +54,15 @@ def test_read_env_file_ignores_comments(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("# comment\nOZON_API_KEY='quoted'\n\n", encoding="utf-8")
     assert read_env_file(env_file)["OZON_API_KEY"] == "quoted"
+
+
+def test_db_path_follows_environment(tmp_path, monkeypatch):
+    target = tmp_path / "nested" / "custom.db"
+    monkeypatch.setenv("OZON_ANALYTICS_DB", str(target))
+    assert db_path() == target
+    with connection() as db:
+        db.execute("CREATE TABLE IF NOT EXISTS probe(id INTEGER PRIMARY KEY)")
+    assert target.exists()
 
 
 def test_finance_period_uses_protobuf_utc():

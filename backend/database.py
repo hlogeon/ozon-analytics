@@ -7,13 +7,24 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-DB_PATH = Path(os.getenv("OZON_ANALYTICS_DB", Path(__file__).parent / "analytics.db"))
+from .config import load_dotenv
+
+# .env must reach os.environ before any OZON_ANALYTICS_DB lookup below.
+load_dotenv()
+
+DEFAULT_DB_PATH = Path(__file__).parent / "analytics.db"
+
+
+def db_path() -> Path:
+    """Resolve the database file on every use so a late .env/env change applies."""
+    return Path(os.getenv("OZON_ANALYTICS_DB") or DEFAULT_DB_PATH)
 
 
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection]:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
     try:
